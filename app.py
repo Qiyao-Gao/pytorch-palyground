@@ -206,16 +206,16 @@ def plot_decision_boundary(
     y_test: Optional[np.ndarray],
     n_classes: int,
     show_test: bool,
-):
+) -> plt.Figure:
     colors = plt.cm.get_cmap("tab10", n_classes)
     cmap = ListedColormap(colors(range(n_classes)))
-    plt.figure(figsize=(7, 5))
-    plt.contourf(grid_x, grid_y, grid_pred, alpha=0.3, cmap=cmap, levels=n_classes)
-    plt.scatter(
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.contourf(grid_x, grid_y, grid_pred, alpha=0.3, cmap=cmap, levels=n_classes)
+    ax.scatter(
         X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolor="k", label="train", s=25
     )
     if show_test and X_test is not None and y_test is not None:
-        plt.scatter(
+        ax.scatter(
             X_test[:, 0],
             X_test[:, 1],
             c=y_test,
@@ -225,16 +225,15 @@ def plot_decision_boundary(
             s=30,
             marker="^",
         )
-    plt.legend(loc="upper right")
-    plt.xlabel("Feature 1")
-    plt.ylabel("Feature 2")
-    plt.title("Decision boundary")
-    plt.tight_layout()
-    st.pyplot(plt.gcf())
-    plt.close()
+    ax.legend(loc="upper right")
+    ax.set_xlabel("Feature 1")
+    ax.set_ylabel("Feature 2")
+    ax.set_title("Decision boundary")
+    fig.tight_layout()
+    return fig
 
 
-def plot_training_curves(history: List[float], accuracies: List[float]):
+def plot_training_curves(history: List[float], accuracies: List[float]) -> plt.Figure:
     epochs = range(1, len(history) + 1)
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].plot(epochs, history, marker="o")
@@ -248,9 +247,8 @@ def plot_training_curves(history: List[float], accuracies: List[float]):
     axes[1].set_ylabel("Accuracy")
     axes[1].set_ylim(0, 1.05)
 
-    plt.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+    fig.tight_layout()
+    return fig
 
 
 def main() -> None:
@@ -302,23 +300,34 @@ def main() -> None:
             np.random.seed(random_state)
             X, y, n_classes = make_dataset(dataset, n_samples, noise, random_state)
             boundary_placeholder = st.empty()
+            metrics_placeholder = st.empty()
             progress = st.progress(0.0, text="Training model...")
 
             def update_boundary(epoch_idx: int, history: List[float], acc: List[float], model: nn.Module):
+                """Stream live decision boundary + curves into placeholders during training."""
                 grid_x, grid_y, grid_pred = build_decision_boundary(model, X, device, grid_size=120)
-                with boundary_placeholder.container():
-                    st.caption(f"Epoch {epoch_idx + 1}/{epochs} – loss {history[-1]:.4f}, test acc {acc[-1]*100:.1f}%")
-                    plot_decision_boundary(
-                        grid_x,
-                        grid_y,
-                        grid_pred,
-                        X_train=X_train,
-                        y_train=y_train,
-                        X_test=X_test,
-                        y_test=y_test,
-                        n_classes=n_classes,
-                        show_test=show_test,
-                    )
+                boundary_container = boundary_placeholder.container()
+                boundary_container.caption(
+                    f"Epoch {epoch_idx + 1}/{epochs} – loss {history[-1]:.4f}, test acc {acc[-1]*100:.1f}%"
+                )
+                boundary_fig = plot_decision_boundary(
+                    grid_x,
+                    grid_y,
+                    grid_pred,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_test=X_test,
+                    y_test=y_test,
+                    n_classes=n_classes,
+                    show_test=show_test,
+                )
+                boundary_container.pyplot(boundary_fig)
+                plt.close(boundary_fig)
+
+                metrics_fig = plot_training_curves(history, acc)
+                metrics_placeholder.pyplot(metrics_fig)
+                plt.close(metrics_fig)
+
                 progress.progress(min((epoch_idx + 1) / epochs, 1.0))
 
             X_train, X_test, y_train, y_test = train_test_split(
@@ -354,7 +363,7 @@ def main() -> None:
         else:
             result: TrainingResult = st.session_state.result
             st.subheader("Decision boundary")
-            plot_decision_boundary(
+            boundary_fig = plot_decision_boundary(
                 result.grid_x,
                 result.grid_y,
                 result.grid_pred,
@@ -365,9 +374,13 @@ def main() -> None:
                 st.session_state.n_classes,
                 show_test,
             )
+            st.pyplot(boundary_fig)
+            plt.close(boundary_fig)
 
             st.subheader("Training curves")
-            plot_training_curves(result.history, result.accuracies)
+            metrics_fig = plot_training_curves(result.history, result.accuracies)
+            st.pyplot(metrics_fig)
+            plt.close(metrics_fig)
 
             st.metric("Final test accuracy", f"{result.accuracies[-1]*100:.1f}%")
             st.caption(
