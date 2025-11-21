@@ -14,8 +14,6 @@ A lightweight, Streamlit-based playground inspired by TensorFlow Playground but 
    ```
 3. Open the provided local URL in your browser to experiment with datasets, architecture depth, activations, and optimizer settings.
 
-> Can this run "here"? The playground needs a Streamlit webserver to be reachable in your browser. In this chat environment there is no shared browser window, so please run the above `streamlit run app.py` command on your own machine (or a local container) and open the displayed URL to interact with the UI.
-
 ## Features
 - Choose among moons, circles, or blobs toy datasets with adjustable noise and sample size.
 - Configure number of hidden layers, hidden units, and activation functions.

@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,12 +20,11 @@ class TrainingResult:
     model: nn.Module
     X_train: np.ndarray
     y_train: np.ndarray
-    X_test: np.ndarray
-    y_test: np.ndarray
+    X_val: np.ndarray
+    y_val: np.ndarray
     grid_x: np.ndarray
     grid_y: np.ndarray
     grid_pred: np.ndarray
-    snapshots: List[Tuple[np.ndarray, np.ndarray, np.ndarray]]
 
 
 def make_dataset(
@@ -34,38 +33,20 @@ def make_dataset(
     noise: float,
     random_state: int,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
-    rng = np.random.default_rng(random_state)
-    if name == "rings":
-        X, y = datasets.make_circles(
-            n_samples=n_samples, noise=noise, factor=0.4, random_state=random_state
-        )
+    if name == "moons":
+        X, y = datasets.make_moons(n_samples=n_samples, noise=noise, random_state=random_state)
         n_classes = 2
-    elif name == "xor":
-        n_samples_per_quadrant = n_samples // 4
-        centers = np.array([[-1, -1], [-1, 1], [1, -1], [1, 1]], dtype=np.float32)
-        jitter = rng.normal(scale=0.4 + noise, size=(4, n_samples_per_quadrant, 2))
-        X = (centers[:, None, :] + jitter).reshape(-1, 2)
-        y = np.array([0, 1, 1, 0], dtype=np.int64).repeat(n_samples_per_quadrant)
+    elif name == "circles":
+        X, y = datasets.make_circles(n_samples=n_samples, noise=noise, factor=0.4, random_state=random_state)
         n_classes = 2
-    elif name == "spiral":
-        n_samples_per_class = n_samples // 2
-        theta = np.linspace(0, 3 * math.pi, n_samples_per_class)
-        r = np.linspace(0.2, 5, n_samples_per_class)
-        x1 = np.stack((r * np.cos(theta), r * np.sin(theta)), axis=1)
-        x2 = np.stack((r * np.cos(theta + math.pi), r * np.sin(theta + math.pi)), axis=1)
-        X = np.concatenate([x1, x2], axis=0)
-        X += rng.normal(scale=noise, size=X.shape)
-        y = np.concatenate([np.zeros(n_samples_per_class), np.ones(n_samples_per_class)])
-        n_classes = 2
-    else:  # two-sides / blobs
+    else:
         X, y = datasets.make_blobs(
             n_samples=n_samples,
-            centers=[(-3, 0), (3, 0)],
+            centers=3,
             cluster_std=1.2 + noise,
             random_state=random_state,
         )
-        n_classes = 2
-
+        n_classes = 3
     return X.astype(np.float32), y.astype(np.int64), n_classes
 
 
@@ -104,20 +85,14 @@ def train_model(
     weight_decay: float,
     batch_size: int,
     epochs: int,
-    test_split: float,
+    val_split: float,
     device: torch.device,
-    on_epoch: Optional[Callable[[int, List[float], List[float], nn.Module], None]] = None,
-    X_train: Optional[np.ndarray] = None,
-    y_train: Optional[np.ndarray] = None,
-    X_test: Optional[np.ndarray] = None,
-    y_test: Optional[np.ndarray] = None,
 ) -> TrainingResult:
-    if any(arr is None for arr in [X_train, y_train, X_test, y_test]):
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_split, random_state=42, stratify=y
-        )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=val_split, random_state=42, stratify=y
+    )
     train_ds = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
-    val_ds = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
+    val_ds = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
 
@@ -129,9 +104,8 @@ def train_model(
 
     history: List[float] = []
     accuracies: List[float] = []
-    snapshots: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
-    for epoch_idx in range(epochs):
+    for _ in range(epochs):
         model.train()
         epoch_loss = 0.0
         for batch_X, batch_y in train_loader:
@@ -154,12 +128,6 @@ def train_model(
                 total += batch_y.size(0)
         accuracies.append(correct / max(total, 1))
 
-        if on_epoch is not None:
-            on_epoch(epoch_idx, history, accuracies, model)
-
-        if epoch_idx % max(1, epochs // 12) == 0 or epoch_idx == epochs - 1:
-            snapshots.append(build_decision_boundary(model, X, device, grid_size=120))
-
     grid_x, grid_y, grid_pred = build_decision_boundary(model, X, device)
     return TrainingResult(
         history=history,
@@ -167,12 +135,11 @@ def train_model(
         model=model,
         X_train=X_train,
         y_train=y_train,
-        X_test=X_test,
-        y_test=y_test,
+        X_val=X_val,
+        y_val=y_val,
         grid_x=grid_x,
         grid_y=grid_y,
         grid_pred=grid_pred,
-        snapshots=snapshots,
     )
 
 
@@ -196,29 +163,16 @@ def plot_decision_boundary(
     grid_pred: np.ndarray,
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_test: Optional[np.ndarray],
-    y_test: Optional[np.ndarray],
+    X_val: np.ndarray,
+    y_val: np.ndarray,
     n_classes: int,
-    show_test: bool,
 ):
     colors = plt.cm.get_cmap("tab10", n_classes)
     cmap = ListedColormap(colors(range(n_classes)))
     plt.figure(figsize=(7, 5))
     plt.contourf(grid_x, grid_y, grid_pred, alpha=0.3, cmap=cmap, levels=n_classes)
-    plt.scatter(
-        X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolor="k", label="train", s=25
-    )
-    if show_test and X_test is not None and y_test is not None:
-        plt.scatter(
-            X_test[:, 0],
-            X_test[:, 1],
-            c=y_test,
-            cmap=cmap,
-            edgecolor="white",
-            label="test",
-            s=30,
-            marker="^",
-        )
+    plt.scatter(X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolor="k", label="train", s=25)
+    plt.scatter(X_val[:, 0], X_val[:, 1], c=y_val, cmap=cmap, edgecolor="white", label="val", s=25, marker="^")
     plt.legend(loc="upper right")
     plt.xlabel("Feature 1")
     plt.ylabel("Feature 2")
@@ -237,7 +191,7 @@ def plot_training_curves(history: List[float], accuracies: List[float]):
     axes[0].set_ylabel("Loss")
 
     axes[1].plot(epochs, accuracies, marker="o", color="green")
-    axes[1].set_title("Test accuracy")
+    axes[1].set_title("Validation accuracy")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy")
     axes[1].set_ylim(0, 1.05)
@@ -257,9 +211,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     st.sidebar.header("Data")
-    dataset = st.sidebar.selectbox(
-        "Dataset", ["rings", "xor", "spiral", "two-sides"], index=0, format_func=str.title
-    )
+    dataset = st.sidebar.selectbox("Dataset", ["moons", "circles", "blobs"], index=0)
     n_samples = st.sidebar.slider("Samples", min_value=200, max_value=2000, value=800, step=50)
     noise = st.sidebar.slider("Noise", min_value=0.0, max_value=0.6, value=0.2, step=0.02)
     random_state = st.sidebar.number_input("Random seed", min_value=0, max_value=10_000, value=42, step=1)
@@ -274,8 +226,7 @@ def main() -> None:
     weight_decay = st.sidebar.number_input("Weight decay", min_value=0.0, max_value=0.5, value=0.0, step=0.01)
     batch_size = st.sidebar.slider("Batch size", 8, 256, 64, step=8)
     epochs = st.sidebar.slider("Epochs", 1, 200, 60, step=1)
-    test_split = st.sidebar.slider("Test split", 0.1, 0.4, 0.2, step=0.05)
-    show_test = st.sidebar.checkbox("Show test data", value=True)
+    val_split = st.sidebar.slider("Validation split", 0.1, 0.4, 0.2, step=0.05)
 
     st.sidebar.info(f"Using device: {device}")
 
@@ -295,50 +246,22 @@ def main() -> None:
             torch.manual_seed(random_state)
             np.random.seed(random_state)
             X, y, n_classes = make_dataset(dataset, n_samples, noise, random_state)
-            boundary_placeholder = st.empty()
-            progress = st.progress(0.0, text="Training model...")
-
-            def update_boundary(epoch_idx: int, history: List[float], acc: List[float], model: nn.Module):
-                grid_x, grid_y, grid_pred = build_decision_boundary(model, X, device, grid_size=120)
-                with boundary_placeholder.container():
-                    st.caption(f"Epoch {epoch_idx + 1}/{epochs} – loss {history[-1]:.4f}, test acc {acc[-1]*100:.1f}%")
-                    plot_decision_boundary(
-                        grid_x,
-                        grid_y,
-                        grid_pred,
-                        X_train=X_train,
-                        y_train=y_train,
-                        X_test=X_test,
-                        y_test=y_test,
-                        n_classes=n_classes,
-                        show_test=show_test,
-                    )
-                progress.progress(min((epoch_idx + 1) / epochs, 1.0))
-
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_split, random_state=42, stratify=y
-            )
-            st.session_state.result = train_model(
-                X=X,
-                y=y,
-                n_classes=n_classes,
-                X_train=X_train,
-                y_train=y_train,
-                X_test=X_test,
-                y_test=y_test,
-                hidden_layers=hidden_layers,
-                hidden_units=hidden_units,
-                activation=activation,
-                lr=lr,
-                weight_decay=weight_decay,
-                batch_size=batch_size,
-                epochs=epochs,
-                test_split=test_split,
-                device=device,
-                on_epoch=update_boundary,
-            )
-            progress.empty()
-            st.session_state.n_classes = n_classes
+            with st.spinner("Training model..."):
+                st.session_state.result = train_model(
+                    X=X,
+                    y=y,
+                    n_classes=n_classes,
+                    hidden_layers=hidden_layers,
+                    hidden_units=hidden_units,
+                    activation=activation,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    val_split=val_split,
+                    device=device,
+                )
+                st.session_state.n_classes = n_classes
         st.divider()
         st.markdown("This playground runs everything locally in your browser session using CPU.")
 
@@ -354,18 +277,17 @@ def main() -> None:
                 result.grid_pred,
                 result.X_train,
                 result.y_train,
-                result.X_test,
-                result.y_test,
+                result.X_val,
+                result.y_val,
                 st.session_state.n_classes,
-                show_test,
             )
 
             st.subheader("Training curves")
             plot_training_curves(result.history, result.accuracies)
 
-            st.metric("Final test accuracy", f"{result.accuracies[-1]*100:.1f}%")
+            st.metric("Final validation accuracy", f"{result.accuracies[-1]*100:.1f}%")
             st.caption(
-                "Test accuracy is computed on a hold-out split of the generated dataset after every epoch."
+                "Validation accuracy is computed on a hold-out split of the generated dataset after every epoch."
             )
 
 
