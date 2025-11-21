@@ -1,4 +1,5 @@
 import math
+import multiprocessing as mp
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -17,7 +18,7 @@ from torch.utils.data import DataLoader, TensorDataset
 class TrainingResult:
     history: List[float]
     accuracies: List[float]
-    model: nn.Module
+    model: Optional[nn.Module]
     X_train: np.ndarray
     y_train: np.ndarray
     X_test: np.ndarray
@@ -112,11 +113,14 @@ def train_model(
     epochs: int,
     test_split: float,
     device: torch.device,
-    on_epoch: Optional[Callable[[int, List[float], List[float], nn.Module], None]] = None,
+    on_epoch: Optional[
+        Callable[[int, List[float], List[float], nn.Module, np.ndarray], None]
+    ] = None,
     X_train: Optional[np.ndarray] = None,
     y_train: Optional[np.ndarray] = None,
     X_test: Optional[np.ndarray] = None,
     y_test: Optional[np.ndarray] = None,
+    grid_tensor: Optional[torch.Tensor] = None,
 ) -> TrainingResult:
     if any(arr is None for arr in [X_train, y_train, X_test, y_test]):
         X_train, X_test, y_train, y_test = train_test_split(
@@ -127,7 +131,13 @@ def train_model(
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
 
-    model = build_mlp(input_dim=X.shape[1], hidden_layers=hidden_layers, hidden_units=hidden_units, activation_name=activation, output_dim=n_classes)
+    model = build_mlp(
+        input_dim=X.shape[1],
+        hidden_layers=hidden_layers,
+        hidden_units=hidden_units,
+        activation_name=activation,
+        output_dim=n_classes,
+    )
     model.to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -160,13 +170,22 @@ def train_model(
                 total += batch_y.size(0)
         accuracies.append(correct / max(total, 1))
 
-        if on_epoch is not None:
-            on_epoch(epoch_idx, history, accuracies, model)
+        if on_epoch is not None and grid_tensor is not None:
+            with torch.no_grad():
+                grid_pred = (
+                    model(grid_tensor.to(device))
+                    .argmax(dim=1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                )
+            on_epoch(epoch_idx, history, accuracies, model, grid_pred)
 
         if epoch_idx % max(1, epochs // 12) == 0 or epoch_idx == epochs - 1:
-            snapshots.append(build_decision_boundary(model, X, device, grid_size=120))
+            snapshots.append(build_decision_boundary(model, X, device, grid_size=240))
 
-    grid_x, grid_y, grid_pred = build_decision_boundary(model, X, device)
+    grid_x, grid_y, grid_pred = build_decision_boundary(model, X, device, grid_size=350)
     return TrainingResult(
         history=history,
         accuracies=accuracies,
@@ -183,7 +202,7 @@ def train_model(
 
 
 def build_decision_boundary(
-    model: nn.Module, X: np.ndarray, device: torch.device, grid_size: int = 200
+    model: nn.Module, X: np.ndarray, device: torch.device, grid_size: int = 300
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
     y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
@@ -194,6 +213,79 @@ def build_decision_boundary(
     with torch.no_grad():
         preds = model(torch.from_numpy(grid).to(device)).argmax(dim=1).cpu().numpy()
     return xx, yy, preds.reshape(xx.shape)
+
+
+def make_grid(X: np.ndarray, grid_size: int = 350) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
+    y_min, y_max = X[:, 1].min() - 0.5, X[:, 1].max() + 0.5
+    xx, yy = np.meshgrid(
+        np.linspace(x_min, x_max, grid_size), np.linspace(y_min, y_max, grid_size)
+    )
+    grid = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float32)
+    return xx, yy, grid
+
+
+def init_boundary_plot(
+    grid_x: np.ndarray,
+    grid_y: np.ndarray,
+    grid_pred: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: Optional[np.ndarray],
+    y_test: Optional[np.ndarray],
+    n_classes: int,
+    show_test: bool,
+) -> Tuple[plt.Figure, plt.Axes, any]:
+    # Use a crisp, discrete palette for clearer decision regions
+    discrete_colors = plt.get_cmap("Set1", max(n_classes, 3))
+    cmap = ListedColormap(discrete_colors(range(max(n_classes, 3))))
+    fig, ax = plt.subplots(figsize=(7, 5))
+    mesh = ax.pcolormesh(
+        grid_x,
+        grid_y,
+        grid_pred,
+        cmap=cmap,
+        shading="nearest",
+        rasterized=True,
+        vmin=-0.5,
+        vmax=n_classes - 0.5,
+    )
+    ax.scatter(
+        X_train[:, 0],
+        X_train[:, 1],
+        c=y_train,
+        cmap=cmap,
+        edgecolor="k",
+        linewidth=0.5,
+        label="train",
+        s=25,
+    )
+    if show_test and X_test is not None and y_test is not None:
+        ax.scatter(
+            X_test[:, 0],
+            X_test[:, 1],
+            c=y_test,
+            cmap=cmap,
+            edgecolor="white",
+            linewidth=0.6,
+            label="test",
+            s=30,
+            marker="^",
+        )
+    ax.legend(loc="upper right")
+    ax.set_xlabel("Feature 1")
+    ax.set_ylabel("Feature 2")
+    ax.set_title("Decision boundary")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    fig.tight_layout()
+    return fig, ax, mesh
+
+
+def update_boundary_plot(mesh: any, grid_pred: np.ndarray) -> None:
+    # Update only the mesh colors for smoother animation
+    mesh.set_array(grid_pred.ravel())
+    mesh.changed()
 
 
 def plot_decision_boundary(
@@ -207,29 +299,9 @@ def plot_decision_boundary(
     n_classes: int,
     show_test: bool,
 ) -> plt.Figure:
-    colors = plt.cm.get_cmap("tab10", n_classes)
-    cmap = ListedColormap(colors(range(n_classes)))
-    fig, ax = plt.subplots(figsize=(7, 5))
-    ax.contourf(grid_x, grid_y, grid_pred, alpha=0.3, cmap=cmap, levels=n_classes)
-    ax.scatter(
-        X_train[:, 0], X_train[:, 1], c=y_train, cmap=cmap, edgecolor="k", label="train", s=25
+    fig, ax, _ = init_boundary_plot(
+        grid_x, grid_y, grid_pred, X_train, y_train, X_test, y_test, n_classes, show_test
     )
-    if show_test and X_test is not None and y_test is not None:
-        ax.scatter(
-            X_test[:, 0],
-            X_test[:, 1],
-            c=y_test,
-            cmap=cmap,
-            edgecolor="white",
-            label="test",
-            s=30,
-            marker="^",
-        )
-    ax.legend(loc="upper right")
-    ax.set_xlabel("Feature 1")
-    ax.set_ylabel("Feature 2")
-    ax.set_title("Decision boundary")
-    fig.tight_layout()
     return fig
 
 
@@ -249,6 +321,83 @@ def plot_training_curves(history: List[float], accuracies: List[float]) -> plt.F
 
     fig.tight_layout()
     return fig
+
+
+def init_training_curves() -> Tuple[plt.Figure, List[plt.Axes], plt.Line2D, plt.Line2D]:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    loss_line, = axes[0].plot([], [], marker="o")
+    acc_line, = axes[1].plot([], [], marker="o", color="green")
+    axes[0].set_title("Training loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[1].set_title("Test accuracy")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Accuracy")
+    axes[1].set_ylim(0, 1.05)
+    fig.tight_layout()
+    return fig, axes, loss_line, acc_line
+
+
+def update_training_curves(
+    axes: List[plt.Axes],
+    loss_line: plt.Line2D,
+    acc_line: plt.Line2D,
+    history: List[float],
+    accuracies: List[float],
+) -> None:
+    epochs = np.arange(1, len(history) + 1)
+    loss_line.set_data(epochs, history)
+    acc_line.set_data(epochs, accuracies)
+    for ax in axes:
+        ax.relim()
+        ax.autoscale_view()
+
+
+def remote_train_worker(conn, args: dict) -> None:
+    torch.manual_seed(args["seed"])
+    np.random.seed(args["seed"])
+
+    def send_update(epoch_idx: int, history: List[float], acc: List[float], model: nn.Module, grid_pred: np.ndarray):
+        conn.send(
+            {
+                "type": "update",
+                "epoch": epoch_idx,
+                "history": history,
+                "accuracies": acc,
+                "grid_pred": grid_pred,
+            }
+        )
+
+    result = train_model(
+        X=args["X"],
+        y=args["y"],
+        n_classes=args["n_classes"],
+        hidden_layers=args["hidden_layers"],
+        hidden_units=args["hidden_units"],
+        activation=args["activation"],
+        lr=args["lr"],
+        weight_decay=args["weight_decay"],
+        batch_size=args["batch_size"],
+        epochs=args["epochs"],
+        test_split=args["test_split"],
+        device=args["device"],
+        on_epoch=send_update,
+        X_train=args["X_train"],
+        y_train=args["y_train"],
+        X_test=args["X_test"],
+        y_test=args["y_test"],
+        grid_tensor=torch.from_numpy(args["grid_points"]).to(args["device"]),
+    )
+
+    conn.send(
+        {
+            "type": "done",
+            "history": result.history,
+            "accuracies": result.accuracies,
+            "grid_pred": result.grid_pred.ravel(),
+        }
+    )
+    conn.close()
 
 
 def main() -> None:
@@ -280,6 +429,7 @@ def main() -> None:
     epochs = st.sidebar.slider("Epochs", 1, 200, 60, step=1)
     test_split = st.sidebar.slider("Test split", 0.1, 0.4, 0.2, step=0.05)
     show_test = st.sidebar.checkbox("Show test data", value=True)
+    remote_mode = st.sidebar.checkbox("Remote GPU worker (experimental)", value=False)
 
     st.sidebar.info(f"Using device: {device}")
 
@@ -303,59 +453,141 @@ def main() -> None:
             metrics_placeholder = st.empty()
             progress = st.progress(0.0, text="Training model...")
 
-            def update_boundary(epoch_idx: int, history: List[float], acc: List[float], model: nn.Module):
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_split, random_state=42, stratify=y
+            )
+
+            grid_x, grid_y, grid_points = make_grid(X, grid_size=350)
+            grid_tensor = torch.from_numpy(grid_points).to(device)
+
+            # Reusable, non-recreated figures for smoother updates
+            boundary_fig = None
+            boundary_mesh = None
+            metrics_fig = None
+            metrics_axes: List[plt.Axes] = []
+            loss_line: Optional[plt.Line2D] = None
+            acc_line: Optional[plt.Line2D] = None
+
+            def update_boundary(epoch_idx: int, history: List[float], acc: List[float], model: nn.Module, grid_pred_flat: np.ndarray):
                 """Stream live decision boundary + curves into placeholders during training."""
-                grid_x, grid_y, grid_pred = build_decision_boundary(model, X, device, grid_size=120)
-                boundary_container = boundary_placeholder.container()
-                boundary_container.caption(
+                nonlocal boundary_fig, boundary_mesh, metrics_fig, metrics_axes, loss_line, acc_line
+                grid_pred = grid_pred_flat.reshape(grid_x.shape)
+                if boundary_fig is None:
+                    boundary_fig, _, boundary_mesh = init_boundary_plot(
+                        grid_x,
+                        grid_y,
+                        grid_pred,
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_test=X_test,
+                        y_test=y_test,
+                        n_classes=n_classes,
+                        show_test=show_test,
+                    )
+                else:
+                    update_boundary_plot(boundary_mesh, grid_pred)
+
+                boundary_placeholder.pyplot(boundary_fig)
+                boundary_placeholder.caption(
                     f"Epoch {epoch_idx + 1}/{epochs} – loss {history[-1]:.4f}, test acc {acc[-1]*100:.1f}%"
                 )
-                boundary_fig = plot_decision_boundary(
-                    grid_x,
-                    grid_y,
-                    grid_pred,
+
+                if metrics_fig is None:
+                    metrics_fig, metrics_axes, loss_line, acc_line = init_training_curves()
+                update_training_curves(metrics_axes, loss_line, acc_line, history, acc)
+                metrics_placeholder.pyplot(metrics_fig)
+
+                progress.progress(min((epoch_idx + 1) / epochs, 1.0))
+
+            if remote_mode:
+                parent_conn, child_conn = mp.Pipe()
+                args = {
+                    "X": X,
+                    "y": y,
+                    "n_classes": n_classes,
+                    "hidden_layers": hidden_layers,
+                    "hidden_units": hidden_units,
+                    "activation": activation,
+                    "lr": lr,
+                    "weight_decay": weight_decay,
+                    "batch_size": batch_size,
+                    "epochs": epochs,
+                    "test_split": test_split,
+                    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+                    "X_train": X_train,
+                    "y_train": y_train,
+                    "X_test": X_test,
+                    "y_test": y_test,
+                    "grid_points": grid_points,
+                    "seed": random_state,
+                }
+                worker = mp.Process(target=remote_train_worker, args=(child_conn, args))
+                worker.start()
+
+                final_history: List[float] = []
+                final_acc: List[float] = []
+                final_grid_pred = None
+
+                while True:
+                    message = parent_conn.recv()
+                    if message["type"] == "update":
+                        update_boundary(
+                            message["epoch"],
+                            message["history"],
+                            message["accuracies"],
+                            None,
+                            message["grid_pred"],
+                        )
+                        final_history = message["history"]
+                        final_acc = message["accuracies"]
+                    elif message["type"] == "done":
+                        final_history = message["history"]
+                        final_acc = message["accuracies"]
+                        final_grid_pred = message["grid_pred"].reshape(grid_x.shape)
+                        break
+                worker.join()
+
+                st.session_state.result = TrainingResult(
+                    history=final_history,
+                    accuracies=final_acc,
+                    model=None,  # model resides on the worker
                     X_train=X_train,
                     y_train=y_train,
                     X_test=X_test,
                     y_test=y_test,
-                    n_classes=n_classes,
-                    show_test=show_test,
+                    grid_x=grid_x,
+                    grid_y=grid_y,
+                    grid_pred=final_grid_pred,
+                    snapshots=[],
                 )
-                boundary_container.pyplot(boundary_fig)
-                plt.close(boundary_fig)
-
-                metrics_fig = plot_training_curves(history, acc)
-                metrics_placeholder.pyplot(metrics_fig)
-                plt.close(metrics_fig)
-
-                progress.progress(min((epoch_idx + 1) / epochs, 1.0))
-
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=test_split, random_state=42, stratify=y
-            )
-            st.session_state.result = train_model(
-                X=X,
-                y=y,
-                n_classes=n_classes,
-                X_train=X_train,
-                y_train=y_train,
-                X_test=X_test,
-                y_test=y_test,
-                hidden_layers=hidden_layers,
-                hidden_units=hidden_units,
-                activation=activation,
-                lr=lr,
-                weight_decay=weight_decay,
-                batch_size=batch_size,
-                epochs=epochs,
-                test_split=test_split,
-                device=device,
-                on_epoch=update_boundary,
-            )
+            else:
+                st.session_state.result = train_model(
+                    X=X,
+                    y=y,
+                    n_classes=n_classes,
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_test=X_test,
+                    y_test=y_test,
+                    hidden_layers=hidden_layers,
+                    hidden_units=hidden_units,
+                    activation=activation,
+                    lr=lr,
+                    weight_decay=weight_decay,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    test_split=test_split,
+                    device=device,
+                    on_epoch=update_boundary,
+                    grid_tensor=grid_tensor,
+                )
             progress.empty()
             st.session_state.n_classes = n_classes
         st.divider()
-        st.markdown("This playground runs everything locally in your browser session using CPU.")
+        st.markdown(
+            "This playground runs locally. If a CUDA GPU is available, training automatically uses it; "
+            "enable the remote worker option when the UI runs on a node without direct GPU access."
+        )
 
     with col2:
         if st.session_state.result is None:
